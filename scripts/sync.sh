@@ -129,7 +129,9 @@ enumerate() {
     append_page
 
     if [ "$stop_id" -gt 0 ]; then
-      min_id="$(cut -f1 "$WORK/win.tsv" | sort -n | head -1)"
+      # awk instead of "sort | head -1": with pipefail, a downstream early exit
+      # makes sort die on EPIPE and would abort the whole run.
+      min_id="$(awk -F'\t' 'NR == 1 { m = $1 } { if ($1 + 0 < m + 0) m = $1 } END { print m }' "$WORK/win.tsv")"
       if [ -n "$min_id" ] && [ "$min_id" -le "$stop_id" ]; then
         log "page ${page}: reached previously published ids (min id ${min_id} <= ${stop_id})"
         break
