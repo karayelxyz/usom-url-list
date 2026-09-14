@@ -1,153 +1,63 @@
-name: Auto Incremental Sync (Every 3 Hours)
+name: Incremental Sync (every 3 hours)
 
 on:
   schedule:
-    - cron: '0 */3 * * *'
+    # Off the top of the hour: GitHub schedules are best effort and the start of
+    # every hour is the busiest slot (see "Events that trigger workflows" docs).
+    - cron: '23 */3 * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Fetch and verify only, publish nothing'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  actions: write   # needed to request a full reconciliation
+
+# Shared with the full sync: only one writer may touch main at a time.
+concurrency:
+  group: usom-sync
+  cancel-in-progress: false
 
 jobs:
-  incremental-sync:
+  incremental:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v5
 
-      - name: Setup environment
+      - name: Configure git identity
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          sudo apt-get update -y && sudo apt-get install -y jq curl
 
-      - name: Load existing URLs
-        id: load-existing
+      - name: Sync
+        id: sync
+        env:
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: bash scripts/sync.sh incremental
+
+      # Removals cannot be seen by a date window: the published list can only grow
+      # between full syncs. When it drifts above the API size, ask for a rebuild.
+      - name: Reconcile removals
+        if: steps.sync.outputs.reconcile == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ -f raw.txt && -s raw.txt ]]; then
-            echo "Existing URLs: $(wc -l < raw.txt)"
-            cp raw.txt /tmp/existing_urls.txt
-            echo "existing_count=$(wc -l < raw.txt)" >> $GITHUB_OUTPUT
-          else
-            touch /tmp/existing_urls.txt
-            echo "existing_count=0" >> $GITHUB_OUTPUT
-          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/manual-full-sync.yml/dispatches" \
+            -d '{"ref":"main"}'
+          echo "Requested a full sync to reconcile removed records."
 
-      - name: Fetch NEW data only (incremental)
-        id: fetch-new
-        run: |
-          API_URL="https://siberguvenlik.gov.tr/api/address/index"
-          PER_PAGE=9999
-
-          echo "Loading existing URLs into hash set..."
-          declare -A EXISTING_URLS
-          while IFS= read -r url; do
-            [[ -n "$url" ]] && EXISTING_URLS["$url"]=1
-          done < /tmp/existing_urls.txt
-          echo "Loaded ${#EXISTING_URLS[@]} existing URLs"
-
-          NEW_URLS_FILE="/tmp/new_urls.txt"
-          > "$NEW_URLS_FILE"
-          NEW_COUNT=0
-
-          page=0
-          stopped=false
-
-          while true; do
-            echo "Fetching page $page..."
-
-            attempt=1
-            max_attempts=5
-            success=false
-            PAGE_FILE="/tmp/page.json"
-
-            while [[ $attempt -le $max_attempts ]]; do
-              HTTP_CODE=$(curl -sSL -o "$PAGE_FILE" -w "%{http_code}" --max-time 120 \
-                -A "Mozilla/5.0" "${API_URL}?per-page=${PER_PAGE}&page=${page}" 2>/dev/null || echo "000")
-
-              if [[ "$HTTP_CODE" == "200" ]] && jq -e '.models' "$PAGE_FILE" >/dev/null 2>&1; then
-                success=true
-                break
-              fi
-
-              echo "  Attempt $attempt failed (HTTP: $HTTP_CODE), retrying..."
-              attempt=$((attempt + 1))
-              sleep $((attempt * 2))
-            done
-
-            if [[ "$success" != "true" ]]; then
-              echo "ERROR: Failed to fetch page $page after $max_attempts attempts"
-              exit 1
-            fi
-
-            count=$(jq -r '.models | length' "$PAGE_FILE")
-            if [[ "$count" -eq 0 ]]; then
-              echo "Empty page reached."
-              rm -f "$PAGE_FILE"
-              break
-            fi
-
-            page_new=0
-            page_known=0
-
-            jq -r '.models[].url' "$PAGE_FILE" > /tmp/page_urls.txt
-
-            while IFS= read -r url; do
-              if [[ -n "$url" ]]; then
-                if [[ -n "${EXISTING_URLS[$url]:-}" ]]; then
-                  page_known=$((page_known + 1))
-                else
-                  echo "$url" >> "$NEW_URLS_FILE"
-                  EXISTING_URLS["$url"]=1
-                  page_new=$((page_new + 1))
-                  NEW_COUNT=$((NEW_COUNT + 1))
-                fi
-              fi
-            done < /tmp/page_urls.txt
-
-            rm -f "$PAGE_FILE"
-
-            echo "  Page $page: $page_new new, $page_known known (total new: $NEW_COUNT)"
-
-            if [[ $page_new -eq 0 && $page_known -gt 0 ]]; then
-              echo "Fully-known page reached. Stopping."
-              stopped=true
-              break
-            fi
-
-            if [[ $page -ge 100 ]]; then
-              echo "Safety limit reached (100 pages)."
-              break
-            fi
-
-            page=$((page + 1))
-            sleep 0.5
-          done
-
-          echo "new_count=$NEW_COUNT" >> $GITHUB_OUTPUT
-
-      - name: Update raw.txt and ubo.txt
-        if: steps.fetch-new.outputs.new_count > 0
-        run: |
-          echo "Prepending ${{ steps.fetch-new.outputs.new_count }} new URLs..."
-          cat /tmp/new_urls.txt raw.txt > /tmp/raw_new.txt
-          mv /tmp/raw_new.txt raw.txt
-          awk '{print "||"$0"^"}' raw.txt > ubo.txt
-          echo "raw.txt: $(wc -l < raw.txt) lines"
-          echo "ubo.txt: $(wc -l < ubo.txt) lines"
-
-      - name: Commit and push changes
-        if: steps.fetch-new.outputs.new_count > 0
-        run: |
-          git add raw.txt ubo.txt
-          git commit -m "chore: incremental sync - +${{ steps.fetch-new.outputs.new_count }} URLs [skip ci]"
-          git push
-          echo "Changes committed and pushed."
-
-      - name: No new data
-        if: steps.fetch-new.outputs.new_count == 0
-        run: echo "No new URLs found. Data is up to date."
+      # Optional liveness signal: add a repository secret named HC_PING_URL
+      # (for example a healthchecks.io ping URL) to be alerted when no sync
+      # completes. A missing ping covers dropped schedules and stuck queues.
+      # - name: Liveness ping
+      #   if: success()
+      #   run: curl -fsS -m 10 "${{ secrets.HC_PING_URL }}" || true

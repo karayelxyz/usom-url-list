@@ -1,123 +1,41 @@
-name: Manual Full Sync (Raw & UBO)
+name: Full Sync (weekly and manual)
 
 on:
+  schedule:
+    # Weekly safety net: rebuilds raw.txt as an exact mirror of the API, which is
+    # also how removed or corrected records leave the published list. The
+    # incremental workflow requests this run early whenever it detects removals.
+    - cron: '17 3 * * 0'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Fetch and verify only, publish nothing'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+# Shared with the incremental sync: only one writer may touch main at a time.
+concurrency:
+  group: usom-sync
+  cancel-in-progress: false
+
 jobs:
-  full-sync:
+  full:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup environment
+      - name: Configure git identity
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          sudo apt-get update -y && sudo apt-get install -y jq curl
 
-      - name: Fetch ALL data and create raw.txt (deduplicated, order preserved)
-        id: fetch
-        run: |
-          API_URL="https://siberguvenlik.gov.tr/api/address/index"
-          PER_PAGE=9999
-
-          echo "Fetching page 0 to get total page count..."
-          INITIAL_RESP=$(curl -sSL --retry 3 --retry-delay 5 --max-time 120 -A "Mozilla/5.0" \
-            "${API_URL}?per-page=${PER_PAGE}&page=0")
-
-          PAGE_COUNT=$(echo "$INITIAL_RESP" | jq -r '.pageCount // empty')
-          TOTAL_COUNT=$(echo "$INITIAL_RESP" | jq -r '.totalCount // empty')
-
-          if [[ -z "$PAGE_COUNT" || "$PAGE_COUNT" == "null" ]]; then
-            echo "ERROR: Failed to retrieve pageCount from API"
-            exit 1
-          fi
-
-          # +1 for safety: catch data that shifted from last page during fetch
-          MAX_PAGE=$((PAGE_COUNT + 1))
-
-          echo "Total records (API): $TOTAL_COUNT"
-          echo "API reported pageCount: $PAGE_COUNT"
-          echo "Fetching pages 0 to $MAX_PAGE (pageCount + 1 for safety)"
-
-          > all_urls.txt
-          TOTAL_FETCHED=0
-
-          for (( page=0; page<=MAX_PAGE; page++ )); do
-            echo "Fetching page $page / $MAX_PAGE..."
-
-            attempt=1
-            max_attempts=5
-            success=false
-            PAGE_FILE="/tmp/page.json"
-
-            while [[ $attempt -le $max_attempts ]]; do
-              HTTP_CODE=$(curl -sSL -o "$PAGE_FILE" -w "%{http_code}" --max-time 120 \
-                -A "Mozilla/5.0" "${API_URL}?per-page=${PER_PAGE}&page=${page}" 2>/dev/null || echo "000")
-
-              if [[ "$HTTP_CODE" == "200" ]] && jq -e '.models' "$PAGE_FILE" >/dev/null 2>&1; then
-                success=true
-                break
-              fi
-
-              echo "  Attempt $attempt failed (HTTP: $HTTP_CODE), retrying..."
-              attempt=$((attempt + 1))
-              sleep $((attempt * 2))
-            done
-
-            if [[ "$success" != "true" ]]; then
-              echo "WARN: Failed to fetch page $page after $max_attempts attempts, skipping."
-              rm -f "$PAGE_FILE"
-              continue
-            fi
-
-            COUNT=$(jq -r '.models | length' "$PAGE_FILE")
-            if [[ "$COUNT" -eq 0 ]]; then
-              echo "  Page $page: empty, skipping."
-              rm -f "$PAGE_FILE"
-              continue
-            fi
-
-            jq -r '.models[].url' "$PAGE_FILE" >> all_urls.txt
-            TOTAL_FETCHED=$((TOTAL_FETCHED + COUNT))
-
-            rm -f "$PAGE_FILE"
-
-            echo "  Page $page: fetched $COUNT (total: $TOTAL_FETCHED)"
-
-            sleep 0.5
-          done
-
-          echo "Total fetched: $TOTAL_FETCHED"
-          echo "Deduplicating (preserving order, newest first)..."
-
-          awk '!seen[$0]++' all_urls.txt > raw.txt
-
-          UNIQUE_COUNT=$(wc -l < raw.txt)
-          echo "Unique URLs: $UNIQUE_COUNT (duplicates removed: $((TOTAL_FETCHED - UNIQUE_COUNT)))"
-
-          rm -f all_urls.txt
-
-          echo "total_written=$UNIQUE_COUNT" >> $GITHUB_OUTPUT
-
-      - name: Convert raw.txt to ubo.txt
-        run: |
-          awk '{print "||"$0"^"}' raw.txt > ubo.txt
-          echo "ubo.txt: $(wc -l < ubo.txt) lines"
-
-      - name: Commit and push changes
-        run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            git add raw.txt ubo.txt
-            git commit -m "chore: full sync - $(date -u +'%Y-%m-%d %H:%M:%S UTC') [skip ci]"
-            git push
-            echo "Changes committed and pushed."
-          else
-            echo "No changes to commit."
-          fi
+      - name: Sync
+        env:
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: bash scripts/sync.sh full
