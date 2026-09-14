@@ -1,27 +1,26 @@
 #!/usr/bin/env bash
 #
-# USOM address feed sync engine (drift-free capture, mirror-exact output).
+# USOM address feed sync engine (offset-free capture, mirror-exact output).
 #
-# Capture strategy -- no offset paging over a live feed:
+# Capture strategy:
 #   * Every request is scoped to a publication-date window (date_gte / date_lte,
-#     documented in the API OpenAPI spec at /api/openapi.yaml).
-#   * A CLOSED window (fully in the past) cannot receive new records, so offset
-#     paging inside it cannot drift, and the API reports its exact record count,
-#     which fixes the number of pages up front.
-#   * The OPEN window (watermark .. now) is enumerated by splitting on the date
-#     axis: the newest page is used only to pick a pivot, the closed part below
-#     the pivot is enumerated, and the remaining newer part is handled by the
-#     next iteration. Records inserted meanwhile carry a newer date and are seen
-#     by a later iteration.
-#   * The incremental run never splits: if its window is larger than one page it
-#     asks for a full sync instead of risking a shifted offset.
-#   * Boundary records of a split are counted twice by design; de-duplication is
-#     done on the record id, which is unique.
+#     documented in the API OpenAPI spec at /api/openapi.yaml) and every response
+#     is verified: the API must return exactly min(totalCount, per-page, left)
+#     records. A short page is retried and can never be accepted silently.
+#   * The feed is walked downwards by shrinking date_lte to the oldest
+#     publication date of the page just received. No offset is used, so records
+#     inserted while the sync runs cannot shift a page boundary: nothing is
+#     skipped and nothing but the boundary group is seen twice.
+#   * Boundary records are part of both windows by design and are removed by
+#     de-duplicating on the record id, which is unique.
+#   * The only place offsets are used is a single timestamp group larger than one
+#     page, which cannot be split by date. Such a group is frozen: ordinary
+#     inserts always carry a newer date.
 #
 # Completeness proof for the full sync:
 #   The number of distinct ids must cover the API's own totalCount before raw.txt
 #   is replaced, and the enumeration is retried up to three times. A partial or
-#   flaky enumeration therefore fails loudly and leaves the published list as is.
+#   flaky enumeration fails loudly and leaves the published list as is.
 #
 # Usage: sync.sh <incremental|full>
 #   incremental  add records published since the stored watermark
@@ -33,14 +32,15 @@ set -euo pipefail
 
 MODE="${1:-incremental}"
 API_URL="${API_URL:-https://siberguvenlik.gov.tr/api/address/index}"
-PER_PAGE="${PER_PAGE:-9999}"      # documented API maximum
+PER_PAGE="${PER_PAGE:-9999}"            # documented API maximum
 REQUEST_DELAY="${REQUEST_DELAY:-0.3}"   # politeness delay between API calls
-OVERLAP_SECONDS=3600              # re-read the tail of the window; de-duplicated
+WATERMARK_OVERLAP=3600                  # re-read the tail of the window; de-duplicated
 BOOTSTRAP_FROM="${BOOTSTRAP_FROM:-2017-01-01}"
-MAX_SPLIT_DEPTH=200
+MAX_REQUESTS=2000                       # hard stop against pathological loops
 MAX_PUSH_ATTEMPTS=5
 MAX_ENUM_ATTEMPTS=3
-REMOVAL_TOLERANCE=25              # published-vs-api drift that triggers reconciliation
+PAGE_ATTEMPTS=3
+REMOVAL_TOLERANCE=25
 MIN_PLAUSIBLE_URLS=1000
 
 RAW="raw.txt"
@@ -51,6 +51,9 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 log() { printf '[%s] %s\n' "$MODE" "$*"; }
+urlencode() { jq -sRr @uri <<<"$1"; }
+to_epoch() { date -u -d "${1%%.*}" +%s; }
+
 # Ask the workflow to schedule a full reconciliation (mirror rebuild).
 flag_reconcile() {
   NEED_FULL=1
@@ -59,23 +62,50 @@ flag_reconcile() {
     printf 'reconcile=true\n' >> "$GITHUB_OUTPUT"
   fi
 }
-urlencode() { jq -sRr @uri <<<"$1"; }
-to_epoch() { date -u -d "${1%%.*}" +%s; }
 
-# Fetch one page of one window. Sets API_TOTAL (window totalCount) and WIN_COUNT,
-# and writes the page records (id, date, url) to $WORK/win.tsv.
+REQUEST_COUNT=0
+API_TOTAL=0
+WIN_COUNT=0
+
+# Fetch one page of one window. Verifies the page length before accepting it.
+# Sets API_TOTAL and WIN_COUNT, and writes the records to $WORK/win.tsv.
 probe() {
-  local gte="$1" lte="$2" page="$3" qs json
+  local gte="$1" lte="$2" page="$3" qs json expect remaining attempt
   qs="per-page=${PER_PAGE}&page=${page}&date_gte=$(urlencode "$gte")"
   if [ -n "$lte" ]; then
     qs="${qs}&date_lte=$(urlencode "$lte")"
   fi
-  json="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
-               --retry-max-time 300 --max-time 120 -A "usom-sync/1.0" \
-               "${API_URL}?${qs}")"
-  jq -e '.models' <<<"$json" >/dev/null
-  API_TOTAL="$(jq -r '.totalCount' <<<"$json")"
-  WIN_COUNT="$(jq -r '.count' <<<"$json")"
+
+  attempt=1
+  while :; do
+    REQUEST_COUNT=$((REQUEST_COUNT + 1))
+    if [ "$REQUEST_COUNT" -gt "$MAX_REQUESTS" ]; then
+      log "ERROR: request budget (${MAX_REQUESTS}) exhausted"
+      return 1
+    fi
+
+    json="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+                 --retry-max-time 300 --max-time 120 -A "usom-sync/1.0" \
+                 "${API_URL}?${qs}")"
+    jq -e '.models' <<<"$json" >/dev/null
+    API_TOTAL="$(jq -r '.totalCount' <<<"$json")"
+    WIN_COUNT="$(jq -r '.count' <<<"$json")"
+
+    remaining=$(( API_TOTAL - (page - 1) * PER_PAGE ))
+    expect="$PER_PAGE"
+    if [ "$remaining" -lt "$PER_PAGE" ]; then expect="$remaining"; fi
+    if [ "$expect" -lt 0 ]; then expect=0; fi
+
+    if [ "$WIN_COUNT" -eq "$expect" ]; then break; fi
+    if [ "$attempt" -ge "$PAGE_ATTEMPTS" ]; then
+      log "ERROR: inconsistent page (gte=${gte} lte=${lte:-open} page=${page}): got ${WIN_COUNT}, expected ${expect} of ${API_TOTAL}"
+      return 1
+    fi
+    log "inconsistent page (got ${WIN_COUNT}, expected ${expect}); retrying"
+    attempt=$((attempt + 1))
+    sleep $((attempt * 2))
+  done
+
   jq -r '.models[] | [.id, .date, .url] | @tsv' <<<"$json" > "$WORK/win.tsv"
   sleep "$REQUEST_DELAY"
 }
@@ -95,99 +125,79 @@ append_window() {
   SEEN=$((SEEN + WIN_COUNT))
 }
 
-# Enumerate a closed (past) window completely: the page count is known exactly.
-scan_closed() {
-  local gte="$1" lte="$2" pages page
-  probe "$gte" "$lte" 1
-  if [ "$WIN_COUNT" -eq 0 ]; then return 0; fi
-  append_window
-  pages=$(( (API_TOTAL + PER_PAGE - 1) / PER_PAGE ))
-  page=2
-  while [ "$page" -le "$pages" ]; do
-    probe "$gte" "$lte" "$page"
-    append_window
-    page=$((page + 1))
-  done
-}
-
-# Enumerate an open window by offset. Only used when a single timestamp group is
-# larger than one page, where date splitting cannot make progress. A shortfall is
-# detected by the caller's id assertion.
-page_open_window() {
-  local gte="$1" page=1
+# One exact timestamp group. The only place where offsets are used, because such
+# a group cannot be split by date. The API reports its exact size, and the sum of
+# the pages must match it.
+scan_timestamp_group() {
+  local t="$1" page=1 sum=0 expected=0
   while :; do
-    probe "$gte" "" "$page"
+    probe "$t" "$t" "$page"
+    if [ "$page" -eq 1 ]; then expected="$API_TOTAL"; fi
     if [ "$WIN_COUNT" -eq 0 ]; then break; fi
     append_window
+    sum=$((sum + WIN_COUNT))
     if [ "$WIN_COUNT" -lt "$PER_PAGE" ]; then break; fi
     page=$((page + 1))
   done
-  log "open window from ${gte} enumerated by offset (page ${page})"
+  if [ "$sum" -ne "$expected" ]; then
+    log "ERROR: timestamp group ${t} enumerated ${sum} of ${expected} records"
+    return 1
+  fi
+  log "timestamp group ${t}: ${sum} records"
 }
 
-# Enumerate an open window (start .. now) by splitting on the date axis.
-scan_open() {
-  local cur="$1" depth=0 pivot
+# Walk the feed downwards from $1 by shrinking date_lte. No offsets are used.
+scan_feed() {
+  local gte="$1" lte="" oldest
   while :; do
-    if [ "$depth" -gt "$MAX_SPLIT_DEPTH" ]; then
-      log "ERROR: split depth exceeded at [${cur} .. now]"
-      return 1
-    fi
-
-    probe "$cur" "" 1
+    probe "$gte" "$lte" 1
     if [ "$WIN_COUNT" -eq 0 ]; then
-      log "open window from ${cur}: no records"
+      log "feed from ${gte}: exhausted"
       return 0
     fi
-    if [ "$API_TOTAL" -le "$PER_PAGE" ]; then
-      append_window
+    append_window
+
+    if [ "$WIN_COUNT" -lt "$PER_PAGE" ]; then
       return 0
     fi
 
-    pivot="$(cut -f2 "$WORK/win.tsv" | sort | head -1)"
-    if [ -z "$pivot" ]; then
-      log "ERROR: no split point found above ${cur}"
+    oldest="$(cut -f2 "$WORK/win.tsv" | sort | head -1)"
+    if [ -z "$oldest" ]; then
+      log "ERROR: page has no oldest date (gte=${gte} lte=${lte:-open})"
       return 1
     fi
-    if [ "$(to_epoch "$pivot")" -le "$(to_epoch "$cur")" ]; then
-      log "notice: timestamp group at ${cur} exceeds one page (${API_TOTAL} records)"
-      page_open_window "$cur"
-      return 0
+    if [ -n "$lte" ] && [ "$oldest" = "$lte" ]; then
+      scan_timestamp_group "$oldest"
+      return $?
     fi
-
-    scan_closed "$cur" "$pivot"
-    cur="$pivot"
-    depth=$((depth + 1))
+    if [ "$oldest" = "$gte" ]; then
+      log "ERROR: no downward progress at ${gte}"
+      return 1
+    fi
+    lte="$oldest"
   done
 }
 
-# Full enumeration with de-duplication by id and a completeness assertion.
-enumerate_full() {
+# Enumerate [from .. now] and de-duplicate on the record id.
+enumerate() {
   : > "$WORK/records.tsv"
   SEEN=0
-  scan_open "$BOOTSTRAP_FROM"
+  scan_feed "$1"
 
   sort -t "$(printf '\t')" -k1,1n -u "$WORK/records.tsv" \
     | sort -t "$(printf '\t')" -k1,1nr > "$WORK/unique.tsv"
   UNIQUE_IDS="$(wc -l < "$WORK/unique.tsv" | tr -d ' ')"
   LAST_DATE="$(cut -f2 "$WORK/unique.tsv" | sort | tail -1)"
   LAST_ID="$(cut -f1 "$WORK/unique.tsv" | sort -n | tail -1)"
-  log "enumerated=${SEEN} distinct_ids=${UNIQUE_IDS} api_total=${GLOBAL_TOTAL}"
-
-  if [ "$UNIQUE_IDS" -lt "$GLOBAL_TOTAL" ]; then
-    log "enumeration short: ${UNIQUE_IDS} of ${GLOBAL_TOTAL} records"
-    return 1
-  fi
-  return 0
+  log "enumerated=${SEEN} distinct_ids=${UNIQUE_IDS} api_total=${GLOBAL_TOTAL} requests=${REQUEST_COUNT}"
 }
 
 # ---------------------------------------------------------------------------
 
 [ -f "$RAW" ] || : > "$RAW"
 : > "$WORK/records.tsv"
+[ -f "$WORK/unique.tsv" ] || : > "$WORK/unique.tsv"
 SEEN=0
-API_TOTAL=0
-WIN_COUNT=0
 UNIQUE_IDS=0
 LAST_DATE=""
 LAST_ID=0
@@ -201,8 +211,11 @@ if [ "$MODE" = "full" ]; then
   enum_ok=0
   attempt=1
   while [ "$attempt" -le "$MAX_ENUM_ATTEMPTS" ]; do
-    if enumerate_full; then enum_ok=1; break; fi
-    log "enumeration attempt ${attempt}/${MAX_ENUM_ATTEMPTS} incomplete; retrying"
+    if enumerate "$BOOTSTRAP_FROM" && [ "$UNIQUE_IDS" -ge "$GLOBAL_TOTAL" ]; then
+      enum_ok=1
+      break
+    fi
+    log "enumeration attempt ${attempt}/${MAX_ENUM_ATTEMPTS} incomplete (${UNIQUE_IDS} of ${GLOBAL_TOTAL})"
     attempt=$((attempt + 1))
   done
   if [ "$enum_ok" -ne 1 ]; then
@@ -213,34 +226,22 @@ if [ "$MODE" = "full" ]; then
 elif [ "$MODE" = "incremental" ]; then
   FROM="$(jq -r '.last_date // empty' "$STATE" 2>/dev/null || true)"
   if [ -n "$FROM" ]; then
-    FROM="$(date -u -d "@$(( $(to_epoch "$FROM") - OVERLAP_SECONDS ))" '+%Y-%m-%d %H:%M:%S')"
+    FROM="$(date -u -d "@$(( $(to_epoch "$FROM") - WATERMARK_OVERLAP ))" '+%Y-%m-%d %H:%M:%S')"
     log "window starts at ${FROM}"
   else
     FROM="1970-01-01"
-    log "no watermark in ${STATE}: reading the newest page"
+    log "no watermark in ${STATE}: enumerating the newest page only"
+    BOOTSTRAP_FROM="$FROM"
   fi
+  enumerate "$FROM"
 
-  probe "$FROM" "" 1
-  if [ "$API_TOTAL" -gt "$PER_PAGE" ]; then
-    flag_reconcile "${API_TOTAL} records pending, more than one page"
-  elif [ "$WIN_COUNT" -gt 0 ]; then
-    append_window
-    sort -t "$(printf '\t')" -k1,1n -u "$WORK/records.tsv" \
-      | sort -t "$(printf '\t')" -k1,1nr > "$WORK/unique.tsv"
-    UNIQUE_IDS="$(wc -l < "$WORK/unique.tsv" | tr -d ' ')"
-    LAST_DATE="$(cut -f2 "$WORK/unique.tsv" | sort | tail -1)"
-    LAST_ID="$(cut -f1 "$WORK/unique.tsv" | sort -n | tail -1)"
-    log "window returned ${WIN_COUNT} records (${API_TOTAL} expected)"
-  else
-    log "no new records in the window"
-  fi
 else
   log "ERROR: unknown mode '${MODE}' (expected: incremental|full)"
   exit 2
 fi
 
-if [ "$SEEN" -eq 0 ] && [ "$UNIQUE_IDS" -eq 0 ]; then
-  log "nothing to publish"
+if [ "$UNIQUE_IDS" -eq 0 ]; then
+  log "no new records; nothing to publish"
   exit 0
 fi
 
@@ -321,7 +322,6 @@ while :; do
   git reset -q --hard origin/main
   sleep $((attempt * 5))
 
-  # Re-apply on top of whatever the remote now holds.
   if [ "$MODE" = "full" ]; then
     cp "$WORK/api_urls.txt" "$WORK/next_raw.txt"
   else
