@@ -51,10 +51,10 @@ trap 'rm -rf "$WORK"' EXIT
 
 log() { printf '[%s] %s\n' "$MODE" "$*"; }
 
-# Ask the workflow to schedule a full reconciliation (mirror rebuild).
+# Flag a manual full reconciliation (mirror rebuild).
 flag_reconcile() {
   NEED_FULL=1
-  log "reconciliation requested: $*"
+  log "notice: $* -- run the manual Full Sync workflow to reconcile removed or corrected records"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     printf 'reconcile=true\n' >> "$GITHUB_OUTPUT"
   fi

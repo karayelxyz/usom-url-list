@@ -14,7 +14,6 @@ on:
 
 permissions:
   contents: write
-  actions: write   # needed to request a full reconciliation
 
 # Shared with the full sync: only one writer may touch main at a time.
 concurrency:
@@ -41,19 +40,10 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: bash scripts/sync.sh incremental
 
-      # Removals cannot be seen by a date window: the published list can only grow
-      # between full syncs. When it drifts above the API size, ask for a rebuild.
-      - name: Reconcile removals
-        if: steps.sync.outputs.reconcile == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          curl -fsS -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/manual-full-sync.yml/dispatches" \
-            -d '{"ref":"main"}'
-          echo "Requested a full sync to reconcile removed records."
+      # Removals cannot be seen by an id walk that stops at the last published
+      # record, so this job only logs a notice when the published list outgrows
+      # the API. Run the manual Full Sync workflow to reconcile removed or
+      # corrected addresses.
 
       # Optional liveness signal: add a repository secret named HC_PING_URL
       # (for example a healthchecks.io ping URL) to be alerted when no sync

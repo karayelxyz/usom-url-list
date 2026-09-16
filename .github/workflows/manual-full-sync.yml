@@ -1,11 +1,9 @@
-name: Full Sync (weekly and manual)
+name: Full Sync (manual)
 
 on:
-  schedule:
-    # Weekly safety net: rebuilds raw.txt as an exact mirror of the API, which is
-    # also how removed or corrected records leave the published list. The
-    # incremental workflow requests this run early whenever it detects removals.
-    - cron: '17 3 * * 0'
+  # Manual only. Use this to build the list from scratch (first run) or to repair
+  # it when something looks wrong. Scheduled updates are handled by the
+  # incremental workflow, which only adds newly published addresses.
   workflow_dispatch:
     inputs:
       dry_run:
