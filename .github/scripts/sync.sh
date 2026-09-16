@@ -222,6 +222,17 @@ elif [ "$MODE" = "incremental" ]; then
     if [ "$need" -gt "$PER_PAGE" ]; then need="$PER_PAGE"; fi
     log "id delta $((NEWEST_ID - STOP_ID)) -> first page size ${need}"
     enumerate "$STOP_ID" "$need"
+  elif [ "$STOP_ID" -gt 0 ]; then
+    # The newest id has not advanced, so nothing was inserted since the last run
+    # and no page needs to be fetched at all: only the published size is checked,
+    # which needs no extra request beyond the probe already made.
+    log "no new records (newest id ${NEWEST_ID} <= last_id ${STOP_ID})"
+    RAW_LINES="$(awk 'NF' "$RAW" | wc -l | tr -d ' ')"
+    if [ $(( RAW_LINES - GLOBAL_TOTAL )) -gt "$REMOVAL_TOLERANCE" ]; then
+      flag_reconcile "published=${RAW_LINES} exceeds api_total=${GLOBAL_TOTAL}"
+    fi
+    log "published=${RAW_LINES} api_total=${GLOBAL_TOTAL}; nothing to publish"
+    exit 0
   else
     log "walking descending pages until id <= ${STOP_ID}"
     enumerate "$STOP_ID"
