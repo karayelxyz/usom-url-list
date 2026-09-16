@@ -1,10 +1,12 @@
-name: Incremental Sync (every 3 hours)
+name: Incremental Sync (every 12 hours)
 
 on:
   schedule:
     # Off the top of the hour: GitHub schedules are best effort and the start of
     # every hour is the busiest slot (see "Events that trigger workflows" docs).
-    - cron: '23 */3 * * *'
+    # Twice a day: batching also removes the fixed cost of every push, which is
+    # rewriting raw.txt plus ubo.txt (about 23 MB) and one Pages build.
+    - cron: '23 */12 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -39,7 +41,7 @@ jobs:
         id: sync
         env:
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
-        run: bash scripts/sync.sh incremental
+        run: bash .github/scripts/sync.sh incremental
 
       # GitHub's own Pages build can fail transiently (seen: a 403 while
       # finalizing the artifact), and GitHub does not retry it, which leaves the
@@ -50,7 +52,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_SHA: ${{ steps.sync.outputs.commit_sha }}
-        run: bash scripts/pages-guard.sh
+        run: bash .github/scripts/pages-guard.sh
 
       # Removals cannot be seen by an id walk that stops at the last published
       # record, so this job only logs a notice when the published list outgrows

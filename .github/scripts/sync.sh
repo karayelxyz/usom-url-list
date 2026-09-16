@@ -44,7 +44,8 @@ MIN_PLAUSIBLE_URLS=1000
 
 RAW="raw.txt"
 UBO="ubo.txt"
-STATE="state.json"
+# Kept outside the repository root: the root holds only the two published files.
+STATE=".github/state.json"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -63,10 +64,13 @@ flag_reconcile() {
 REQUEST_COUNT=0
 API_TOTAL=0
 WIN_COUNT=0
+REQ_SIZE="$PER_PAGE"
 
 # Fetch one page ordered by descending id. Verified before being accepted.
+# $2 is the page size for this request; it defaults to the API maximum.
 probe() {
   local page="$1" json expect remaining attempt
+  REQ_SIZE="${2:-$PER_PAGE}"
   attempt=1
   while :; do
     REQUEST_COUNT=$((REQUEST_COUNT + 1))
@@ -77,14 +81,14 @@ probe() {
 
     json="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
                  --retry-max-time 300 --max-time 120 -A "usom-sync/1.0" \
-                 "${API_URL}?per-page=${PER_PAGE}&page=${page}&sort=-id")"
+                 "${API_URL}?per-page=${REQ_SIZE}&page=${page}&sort=-id")"
     jq -e '.models' <<<"$json" >/dev/null
     API_TOTAL="$(jq -r '.totalCount' <<<"$json")"
     WIN_COUNT="$(jq -r '.count' <<<"$json")"
 
-    remaining=$(( API_TOTAL - (page - 1) * PER_PAGE ))
-    expect="$PER_PAGE"
-    if [ "$remaining" -lt "$PER_PAGE" ]; then expect="$remaining"; fi
+    remaining=$(( API_TOTAL - (page - 1) * REQ_SIZE ))
+    expect="$REQ_SIZE"
+    if [ "$remaining" -lt "$REQ_SIZE" ]; then expect="$remaining"; fi
     if [ "$expect" -lt 0 ]; then expect=0; fi
 
     if [ "$WIN_COUNT" -eq "$expect" ]; then break; fi
@@ -101,13 +105,17 @@ probe() {
   sleep "$REQUEST_DELAY"
 }
 
+# Read the feed size and the newest record id. One tiny request: the newest id
+# is what lets the incremental run size its first page instead of always asking
+# for the API maximum.
 global_total() {
   local json
   json="$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
                --retry-max-time 300 --max-time 120 -A "usom-sync/1.0" \
-               "${API_URL}?per-page=1&page=1")"
+               "${API_URL}?per-page=1&page=1&sort=-id")"
   jq -e '.models' <<<"$json" >/dev/null
-  jq -r '.totalCount' <<<"$json"
+  GLOBAL_TOTAL="$(jq -r '.totalCount' <<<"$json")"
+  NEWEST_ID="$(jq -r '.models[0].id // 0' <<<"$json")"
 }
 
 append_page() {
@@ -117,15 +125,18 @@ append_page() {
 
 # Walk descending pages. stop_id > 0 stops once the page reaches records that
 # were already published; stop_id == 0 walks to the end of the feed.
+# $2 is the first page size. When a full page turns out to be entirely newer than
+# the watermark the estimate was too small, so the page size is doubled (up to
+# the API maximum) and the same page is requested again.
 enumerate() {
-  local stop_id="$1" page=1 min_id limit
+  local stop_id="$1" size="${2:-$PER_PAGE}" page=1 min_id limit
   : > "$WORK/records.tsv"
   SEEN=0
   limit="$MAX_REQUESTS"
   if [ "$MODE" = "incremental" ]; then limit="$MAX_INCREMENTAL_PAGES"; fi
 
   while :; do
-    probe "$page"
+    probe "$page" "$size"
     append_page
 
     if [ "$stop_id" -gt 0 ]; then
@@ -136,9 +147,15 @@ enumerate() {
         log "page ${page}: reached previously published ids (min id ${min_id} <= ${stop_id})"
         break
       fi
+      if [ "$WIN_COUNT" -ge "$size" ] && [ "$size" -lt "$PER_PAGE" ]; then
+        size=$(( size * 2 ))
+        if [ "$size" -gt "$PER_PAGE" ]; then size="$PER_PAGE"; fi
+        log "page ${page} was full and entirely newer than ${stop_id}; widening the page to ${size}"
+        continue
+      fi
     fi
 
-    if [ "$WIN_COUNT" -lt "$PER_PAGE" ]; then
+    if [ "$WIN_COUNT" -lt "$size" ]; then
       log "page ${page}: end of feed reached"
       break
     fi
@@ -168,9 +185,11 @@ LAST_DATE=""
 LAST_ID=0
 NEED_FULL=0
 NEW_COUNT=0
+GLOBAL_TOTAL=0
+NEWEST_ID=0
 
-GLOBAL_TOTAL="$(global_total)"
-log "api global total: ${GLOBAL_TOTAL}"
+global_total
+log "api global total: ${GLOBAL_TOTAL} (newest id ${NEWEST_ID})"
 
 if [ "$MODE" = "full" ]; then
   enum_ok=0
@@ -193,8 +212,20 @@ if [ "$MODE" = "full" ]; then
 elif [ "$MODE" = "incremental" ]; then
   STOP_ID="$(jq -r '.last_id // 0' "$STATE" 2>/dev/null || echo 0)"
   if [ -z "$STOP_ID" ] || [ "$STOP_ID" = "null" ]; then STOP_ID=0; fi
-  log "walking descending pages until id <= ${STOP_ID}"
-  enumerate "$STOP_ID"
+
+  if [ "$STOP_ID" -gt 0 ] && [ "$NEWEST_ID" -gt "$STOP_ID" ]; then
+    # Ids grow by about two per record, so the number of records added since the
+    # last run is roughly half the id delta. Start at 1.5x that estimate with a
+    # floor; enumerate() widens the page when the estimate turns out to be short.
+    need=$(( (NEWEST_ID - STOP_ID) * 3 / 4 + 20 ))
+    if [ "$need" -lt 20 ]; then need=20; fi
+    if [ "$need" -gt "$PER_PAGE" ]; then need="$PER_PAGE"; fi
+    log "id delta $((NEWEST_ID - STOP_ID)) -> first page size ${need}"
+    enumerate "$STOP_ID" "$need"
+  else
+    log "walking descending pages until id <= ${STOP_ID}"
+    enumerate "$STOP_ID"
+  fi
 else
   log "ERROR: unknown mode '${MODE}' (expected: incremental|full)"
   exit 2
