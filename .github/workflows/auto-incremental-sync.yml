@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  actions: write   # the Pages guard may re-run a failed Pages build
 
 # Shared with the full sync: only one writer may touch main at a time.
 concurrency:
@@ -39,6 +40,17 @@ jobs:
         env:
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: bash scripts/sync.sh incremental
+
+      # GitHub's own Pages build can fail transiently (seen: a 403 while
+      # finalizing the artifact), and GitHub does not retry it, which leaves the
+      # published site stale. This waits for that run and re-runs it once.
+      - name: Guard the Pages deployment
+        if: steps.sync.outputs.pushed == 'true'
+        continue-on-error: true   # never fail the data sync over a deploy issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.sync.outputs.commit_sha }}
+        run: bash scripts/pages-guard.sh
 
       # Removals cannot be seen by an id walk that stops at the last published
       # record, so this job only logs a notice when the published list outgrows

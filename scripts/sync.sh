@@ -269,6 +269,10 @@ while :; do
 
   if git push -q origin HEAD:main; then
     log "pushed: ${RAW_LINES} urls (mode ${MODE}, +${NEW_COUNT} new)"
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then
+      printf 'pushed=true\n' >> "$GITHUB_OUTPUT"
+      printf 'commit_sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+    fi
     exit 0
   fi
 
