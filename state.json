@@ -1,8 +1,8 @@
 {
-  "mode": "full",
-  "last_date": "2026-09-16 20:03:45.81424",
-  "last_id": 1168938,
-  "url_count": 492903,
-  "api_total": 492903,
-  "updated_at": "2026-09-16T20:46:49Z"
+  "mode": "incremental",
+  "last_date": "2026-09-16 20:37:28.903474",
+  "last_id": 1168940,
+  "url_count": 492904,
+  "api_total": 492904,
+  "updated_at": "2026-09-16T20:49:17Z"
 }
