@@ -1,12 +1,12 @@
-name: Incremental Sync (every 12 hours)
+name: Incremental Sync (every 6 hours)
 
 on:
   schedule:
     # Off the top of the hour: GitHub schedules are best effort and the start of
     # every hour is the busiest slot (see "Events that trigger workflows" docs).
-    # Twice a day: batching also removes the fixed cost of every push, which is
-    # rewriting raw.txt plus ubo.txt (about 23 MB) and one Pages build.
-    - cron: '23 */12 * * *'
+    # Four times a day: batching also removes the fixed cost of every push, which
+    # is rewriting raw.txt plus ubo.txt (about 23 MB) and one Pages build.
+    - cron: '23 */6 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
